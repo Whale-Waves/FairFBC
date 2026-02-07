@@ -1,8 +1,11 @@
 function label = fairness_aware_assignment(F, Yg, nCluster, opts)
 
 if nargin < 4, opts = struct(); end
-if ~isfield(opts,'ambig_quantile'), opts.ambig_quantile = 0.25; end
-if ~isfield(opts,'max_exact_ambiguous'), opts.max_exact_ambiguous = 10000; end
+% Default quantile parameter tau from paper (default tau=0.10)
+if ~isfield(opts,'ambig_quantile'), opts.ambig_quantile = 0.10; end
+% max_exact_ambiguous can control when to fallback to greedy if matching is too slow
+% Though the paper solves the matching problem exactly (Eq 18).
+if ~isfield(opts,'max_exact_ambiguous'), opts.max_exact_ambiguous = 15000; end 
 if ~isfield(opts,'verbose'), opts.verbose = true; end
 
 [n, c] = size(F);
@@ -10,310 +13,312 @@ if c ~= nCluster
     error('nCluster must equal number of columns in F');
 end
 
-% Basic data
+% Extract group indices
 [~, group] = max(Yg, [], 2);    % group labels 1..G
 G = size(Yg,2);
 
-% 1) Greedy baseline
-[~, label_greedy] = max(F, [], 2);
+%% 1) Freeze confident assignments.
+% Define greedy label l_i = argmax_k F_{ik}
+[sortedF, sortedIdx] = sort(F, 2, 'descend');
+label_greedy = sortedIdx(:, 1);
 
-% 2) Find ambiguous samples via adaptive gap threshold (max - 2nd max)
-[sortedVals, ~] = sort(F, 2, 'descend');
-gaps = sortedVals(:,1) - sortedVals(:,2);
-thresh = quantile(gaps, opts.ambig_quantile);
-ambig_mask = (gaps <= thresh);
+% Compute confidence gap Delta_i = sigma_i^(1) - sigma_i^(2)
+gaps = sortedF(:, 1) - sortedF(:, 2);
+
+% Define threshold t = Quantile_tau(Delta_i)
+t = quantile(gaps, opts.ambig_quantile);
+
+% Split into N (confident) and A (ambiguous) sets
+% N = {i : Delta_i > t}, A = X \ N
+confident_mask = (gaps > t);
+ambig_mask = ~confident_mask;
+
+confident_idx = find(confident_mask);
 ambig_idx = find(ambig_mask);
-n_a = numel(ambig_idx);
+
+% Initialize final labels with greedy labels
+label = label_greedy;
+
+% All i in N are fixed to y_hat_i = l_i (already set in 'label')
+
+if isempty(ambig_idx)
+    if opts.verbose
+        fprintf('No ambiguous samples found. Returning greedy labels.\n');
+    end
+    return;
+end
+
+n_a = length(ambig_idx);
 if opts.verbose
     fprintf('Ambiguous threshold (quantile %.3g) = %.6g, ambiguous samples = %d / %d\n', ...
-            opts.ambig_quantile, thresh, n_a, n);
+            opts.ambig_quantile, t, n_a, n);
 end
 
-% If no ambiguous, return greedy
-if n_a == 0
-    label = label_greedy;
-        return;
-    end
-    
-% 3) Compute remaining capacity rem_gk for ambiguous samples
 
-group_counts = sum(Yg,1)';                  % G x 1 total group sizes
-% current (non-ambiguous) assignment counts
-nonamb_idx = find(~ambig_mask);
-[grp_nonamb, lbl_nonamb] = deal(group(nonamb_idx), label_greedy(nonamb_idx));
-curr_nonambig = zeros(G, c);
-if ~isempty(nonamb_idx)
-    curr_nonambig = full(accumarray([grp_nonamb, lbl_nonamb], 1, [G, c]));
+%% 2) Derive group--cluster quotas for ambiguous samples.
+% C_{gk} = |{i in N : g(i)=g, y_hat_i=k}|
+% a_g = |{i in A : g(i)=g}|
+
+% Calculate C_{gk}
+groups_conf = group(confident_idx);
+labels_conf = label(confident_idx);
+
+% Careful with sparse accumarray if confident_idx is empty
+if isempty(confident_idx)
+    C_gk = zeros(G, c);
+else
+    C_gk = full(accumarray([groups_conf, labels_conf], 1, [G, c]));
 end
 
-% ambiguous counts per group
-ambig_group_counts = sum(Yg(ambig_idx, :), 1)'; % G x 1
+% Calculate a_g
+a_g = histcounts(group(ambig_idx), 1:G+1)';
 
-% desired per group per cluster (float)
-desired_per_cluster = (group_counts / c);         % G x 1, same for each cluster
-desired_matrix = repmat(desired_per_cluster, 1, c); % G x c
+% Calculate group totals n_g
+n_g = sum(Yg, 1)';
 
-raw_rem_real = desired_matrix - curr_nonambig;
-raw_rem_real(raw_rem_real < 0) = 0;
+% Remaining quota R_real_{gk} = max(0, n_g/c - C_{gk})
+target_per_cluster = n_g / c; % G x 1
+target_matrix = repmat(target_per_cluster, 1, c); % G x c
 
-% Convert raw_rem_real to integer rem_gk with constraints sum(rem_gk(g,:)) == ambiguous_group_counts(g)
-rem_gk = zeros(G, c);
+R_real = max(0, target_matrix - C_gk);
+
+% Convert R_real to integer vector R_{g,:} such that sum_k R_{gk} = a_g
+R_int = zeros(G, c);
+
 for g = 1:G
-    need = ambig_group_counts(g);
-    row_real = raw_rem_real(g, :);
-    if need <= 0
-        rem_gk(g, :) = 0;
+    ag_val = a_g(g);
+    
+    if ag_val == 0
         continue;
     end
-    % If all zeros or sum(row_real) == 0, spread uniformly
-    if sum(row_real) <= 1e-12
-        base = floor(need / c) * ones(1,c);
-        leftover = need - sum(base);
-        if leftover > 0
-            base(1:leftover) = base(1:leftover) + 1;
-        end
-        rem_gk(g, :) = base;
-        continue;
+    
+    row_real = R_real(g, :);
+    
+    % If row_real is all zeros but we need to assign a_g samples (rare edge case where C_gk exceeded target everywhere),
+    % we must distribute a_g somehow. Fallback to distributing based on targets or uniform.
+    if sum(row_real) <= 1e-10
+         % Fallback: distribute proportionally to original targets or just uniformly
+         % Here we use a safe uniform-like distribution mechanism
+         row_real = ones(1, c); 
     end
-    % Otherwise do floor + distribute fractional parts
-    base = floor(row_real);
-    frac = row_real - base;
-    base_sum = sum(base);
-    leftover = need - base_sum;
-    % If leftover negative (shouldn't happen because raw_rem_real >=0), clamp
-    if leftover <= 0
-        % If base_sum >= need: take top 'need' bins by base, but base are integers
-        % a safe fallback: greedy remove from largest base until sum==need
-        % (unlikely), implement robustly:
-        base_sorted = sort(base,'descend');
-        % remove difference
-        diffrem = base_sum - need;
-        if diffrem > 0
-            % subtract from largest buckets
-            [~, order_desc] = sort(base,'descend');
-            idxr = 1;
-            while diffrem > 0 && idxr <= c
-                take = min(base(order_desc(idxr)), diffrem);
-                base(order_desc(idxr)) = base(order_desc(idxr)) - take;
-                diffrem = diffrem - take;
-                idxr = idxr + 1;
-            end
-        end
-        rem_gk(g, :) = base;
-    else
-        % distribute leftover according to largest fractional parts
-        [~, ord_frac] = sort(frac, 'descend');
-        add = zeros(1,c);
-        add(ord_frac(1:leftover)) = 1;
-        rem_gk(g, :) = base + add;
-    end
-end
-
-% Sanity: sums must match ambiguous per group
-diffs = sum(rem_gk,2) - ambig_group_counts;
-if any(abs(diffs) > 0)
-    % Small numerical fix: adjust
-    for g = 1:G
-        d = sum(rem_gk(g,:)) - ambig_group_counts(g);
-        if d > 0
-            % remove from largest entries
-            [~,ord] = sort(rem_gk(g,:),'descend');
-            idx = 1;
-            while d>0 && idx<=c
-                can = min(rem_gk(g,ord(idx)), d);
-                rem_gk(g,ord(idx)) = rem_gk(g,ord(idx)) - can;
-                d = d - can; idx = idx+1;
-            end
-        elseif d < 0
-            % add to largest fractional from raw_rem_real
-            [~,ord] = sort(raw_rem_real(g,:)-floor(raw_rem_real(g,:)),'descend');
-            idx = 1;
-            while d<0 && idx<=c
-                rem_gk(g,ord(idx)) = rem_gk(g,ord(idx)) + 1;
-                d = d + 1; idx = idx+1;
-            end
-        end
-    end
-end
-
-% Clip negatives, ensure integer
-rem_gk(rem_gk < 0) = 0;
-rem_gk = round(rem_gk);
-
-% Final check
-if any(sum(rem_gk,2) ~= ambig_group_counts)
-    % As last resort, set distribution proportional to group desired
-    for g = 1:G
-        need = ambig_group_counts(g);
-        if need == 0, continue; end
-        v = raw_rem_real(g,:);
-        if sum(v) < 1e-12
-            v = ones(1,c);
-        end
-        v = v / sum(v);
-        ints = floor(v * need);
-        leftover = need - sum(ints);
-        [~, ord] = sort(v - floor(v),'descend');
-        % Safety check: ensure leftover doesn't exceed available clusters
-        leftover = min(leftover, c);
-        for k = 1:leftover, ints(ord(k)) = ints(ord(k))+1; end
-        rem_gk(g,:) = ints;
-    end
-end
-
-% 4) Build baseline label_final with greedy labels and replace ambiguous by solved ones
-label_final = label_greedy;
-
-% Attempt exact assignment if small enough
-if n_a <= opts.max_exact_ambiguous
-    if opts.verbose
-        fprintf('Attempting exact assignment on ambiguous subset (n_a=%d) ...\n', n_a);
-    end
-    try
-        % Try to use integer assignment by expanding cluster slots (slot-level assignment)
-        % Build "slots": for each group g and cluster k, create rem_gk(g,k) identical slots
-        total_slots = sum(rem_gk(:));
-        if total_slots ~= n_a
-            error('slot count mismatch: total_slots=%d, n_a=%d', total_slots, n_a);
-        end
-        % Build cost matrix (n_a x n_a): row -> ambiguous sample, col -> slot
-      
-        try
-            
-            slot_cluster = zeros(total_slots,1);
-            slot_group = zeros(total_slots,1);
-            ptr = 0;
-            for g = 1:G
-                for k = 1:c
-                    cnt = rem_gk(g,k);
-                    if cnt > 0
-                        slot_cluster(ptr + (1:cnt)) = k;
-                        slot_group(ptr + (1:cnt)) = g;
-                        ptr = ptr + cnt;
-                    end
-                end
-            end
-            
-            Fsub = F(ambig_idx, :);  % n_a x c
-            
-            if exist('matchpairs','file') == 2
-                % Build full cost matrix (may be large but n_a small here)
-                costMat = zeros(n_a, total_slots);
-                for j = 1:total_slots
-                    k_j = slot_cluster(j);
-                    costMat(:, j) = -Fsub(:, k_j);  % cost: -F (prefer larger F)
-                end
-                % matchpairs finds min cost matching
-                [pairs, ~] = matchpairs(costMat, -Inf); % pairs: [row, col]
-                % pairs may not include all rows if rectangular; ensure full coverage
-                if size(pairs,1) < n_a
-                    error('matchpairs returned partial matching');
-                end
-                assigned_rows = pairs(:,1);
-                assigned_cols = pairs(:,2);
-                % convert to labels
-                for t = 1:length(assigned_rows)
-                    rowIdx = assigned_rows(t);
-                    colIdx = assigned_cols(t);
-                    k_assigned = slot_cluster(colIdx);
-                    global_i = ambig_idx(rowIdx);
-                    label_final(global_i) = k_assigned;
-                end
-                label = label_final;
-                return;
-            else
-                error('matchpairs not found or not reliable here');
-            end
-        catch % if exact slot-level fails, fallback to greedy global candidate assign below
-            if opts.verbose
-                fprintf('Exact slot-level assignment unavailable or failed -> fallback to greedy assignment.\n');
-            end
-        end
-    catch ME
-        if opts.verbose
-            fprintf('Exact assignment attempt failed: %s\n', ME.message);
-        end
+    
+    % Standard largest remainder method / similar logic to ensure sum constraint
+    % 1. Scale row_real so it sums to a_g
+    row_scaled = row_real * (ag_val / sum(row_real));
+    
+    % 2. Take floor
+    row_floor = floor(row_scaled);
+    
+    % 3. Compute remainder
+    rem_count = ag_val - sum(row_floor);
+    
+    % 4. Distribute remainder to largest fractional parts
+    fractional_part = row_scaled - row_floor;
+    [~, sort_idx] = sort(fractional_part, 'descend');
+    
+    row_final = row_floor;
+    if rem_count > 0
+        % Distribute 1 to top 'rem_count' indices
+        % Ensure we don't go out of bounds if rem_count > c (shouldn't happen with floor logic generally)
+        for k_idx = 1:rem_count
+             idx_to_inc = sort_idx(mod(k_idx-1, c) + 1);
+             row_final(idx_to_inc) = row_final(idx_to_inc) + 1;
         end
     end
     
-% Otherwise (large or exact failed): greedy global candidate assignment
-if opts.verbose
-    fprintf('Running global greedy candidate assignment for ambiguous subset (n_a=%d, c=%d)...\n', n_a, c);
+    R_int(g, :) = row_final;
 end
 
-% Prepare per-ambiguous sample structures
-Fsub = F(ambig_idx, :);               % n_a x c
-group_sub = group(ambig_idx);         % n_a x 1
+%% 3) Fair matching on ambiguous samples (maximum weight).
+% Maximize sum_{i in A} sum_k Z_{ik} F_{ik}
+% s.t. sum_k Z_{ik} = 1
+%      sum_{i in A_g} Z_{ik} = R_{gk}
 
-% Build candidate list: (i_local, k) pairs
-% To reduce memory if n_a*c huge, we do chunked sorting: but here we assume n_a moderate.
-ii = repmat((1:n_a)', 1, c);
-kk = repmat(1:c, n_a, 1);
-ii = ii(:);
-kk = kk(:);
-% Create linear indices safely
-linear_indices = (kk - 1) * n_a + ii; 
-scores = -Fsub(linear_indices);  
-
-[sortedScores, ord] = sort(scores, 'ascend');
-ii = ii(ord);
-kk = kk(ord);
-
-assigned_local = false(n_a,1);
-rem_gk_local = rem_gk;  % G x c
-assigned_count = 0;
-
-for t = 1:length(ii)
-    i_local = ii(t);
-    k = kk(t);
-    if assigned_local(i_local)
-        continue;
-    end
-    g = group_sub(i_local);
-    if rem_gk_local(g,k) > 0
-        % assign
-        global_i = ambig_idx(i_local);
-        label_final(global_i) = k;
-        assigned_local(i_local) = true;
-        rem_gk_local(g,k) = rem_gk_local(g,k) - 1;
-        assigned_count = assigned_count + 1;
-        if assigned_count == n_a
-            break;
-        end
-    end
+% This is a maximum weight matching problem.
+% Construct the cost matrix / bi-partite graph.
+% We have n_a ambiguous samples.
+% We have sum(R_int) slots. Note sum(R_int(:)) should equal n_a.
+% Check sum constraint:
+if sum(R_int(:)) ~= n_a
+    % This might happen due to numerical issues or empty groups logic, 
+    % generally with logical construction above it holds.
+    % Force fix if needed or error.
+    warning('Quota sum %d does not match ambiguous count %d. Adjusting last element.', sum(R_int(:)), n_a);
+    diff_val = n_a - sum(R_int(:));
+    % Simply add diff to the first non-zero slot found or just the first slot
+    R_int(1,1) = max(0, R_int(1,1) + diff_val);
 end
 
-% If still unassigned (rare), assign to best available cluster respecting any remaining capacity,
-% otherwise fall back to argmax.
-if any(~assigned_local)
+% We can use matchpairs (linear assignment problem solver) for exact solution.
+% Cost matrix C for matchpairs: rows=samples, cols=slots.
+% matchpairs minimizes cost, so we use -F_{ik}.
+%
+% Implementation Detail:
+% Expanding R_int into individual slots can be very large if n_a is large.
+% If n_a is very large, 'matchpairs' might be slow (O(N^3)).
+% We keep the "greedy" approximate logic as a fallback for massive datasets,
+% but strictly following the request, we implement the matching logic.
+
+use_exact_matching = (n_a <= opts.max_exact_ambiguous);
+
+if use_exact_matching
+    
     if opts.verbose
-        fprintf('Greedy pass left %d unassigned; performing repair step...\n', sum(~assigned_local));
+        fprintf('Solving exact maximum weight matching for %d samples...\n', n_a);
     end
-    % For each unassigned sample, try to assign to cluster with rem > 0, prefer largest F
-    un_idx_local = find(~assigned_local);
-    for t = 1:length(un_idx_local)
-        i_local = un_idx_local(t);
-        global_i = ambig_idx(i_local);
-        g = group_sub(i_local);
-        % find clusters with capacity
-        caps = find(rem_gk_local(g,:) > 0);
-        if ~isempty(caps)
-            % choose argmax among caps
-            [~,bestkIdx] = max(Fsub(i_local, caps));
-            k = caps(bestkIdx);
-            label_final(global_i) = k;
-            rem_gk_local(g,k) = rem_gk_local(g,k) - 1;
-            assigned_local(i_local) = true;
-        else
-            % no remaining capacity (should not happen) -> assign greedy argmax
-            [~,k] = max(Fsub(i_local,:));
-            label_final(global_i) = k;
-            assigned_local(i_local) = true;
+
+    % Construct slots
+    % Slots map: slot_flat_idx -> (cluster_k)
+    % To vectorize, we generate a list of cluster indices for all slots.
+    
+    % R_int is G x c. 
+    % The matching is separable per group!
+    % Constraint: sum_{i \in A_g} Z_{ik} = R_{gk} implies we only match samples in A_g to slots allocated for group g.
+    % We can solve independent matching problems for each group g.
+    
+    current_label_update = zeros(n_a, 1);
+    
+    % Process each group separately
+    for g = 1:G
+        
+        % Indices of ambiguous samples belonging to group g
+        ambig_samples_in_g_indices_local = find(group(ambig_idx) == g); % index into ambig_idx
+        ambig_samples_in_g_indices_global = ambig_idx(ambig_samples_in_g_indices_local);
+        
+        n_a_g = length(ambig_samples_in_g_indices_local);
+        if n_a_g == 0
+            continue;
+        end
+        
+        % Slots for this group: R_int(g, :)
+        quotas_g = R_int(g, :);
+        
+        % Check consistency (sum(quotas_g) should be n_a_g)
+        if sum(quotas_g) ~= n_a_g
+            % Numerical adjustment if off
+             diff_g = n_a_g - sum(quotas_g);
+             [~, max_q_idx] = max(quotas_g);
+             quotas_g(max_q_idx) = max(0, quotas_g(max_q_idx) + diff_g);
+        end
+        
+        % Expand slots for group g
+        % slots_clusters(j) tells us which cluster slot j corresponds to
+        slots_clusters = zeros(1, n_a_g);
+        ptr = 1;
+        for k = 1:c
+            count = quotas_g(k);
+            if count > 0
+                slots_clusters(ptr : ptr + count - 1) = k;
+                ptr = ptr + count;
+            end
+        end
+        
+        % Cost matrix for group g: [n_a_g x n_a_g] matches samples to slots
+        % Cost(i, j) = -F(sample_i, cluster_of_slot_j)
+        
+        % Extract F for these samples: [n_a_g x c]
+        F_sub_g = F(ambig_samples_in_g_indices_global, :);
+        
+        % Build cost matrix
+        CostMat = zeros(n_a_g, n_a_g);
+        
+        % Depending on n_a_g size, vectorization:
+        % CostMat(:, j) = -F_sub_g(:, slots_clusters(j))
+        for j = 1:n_a_g
+            CostMat(:, j) = -F_sub_g(:, slots_clusters(j));
+        end
+        
+        % Solve LAP
+        [assignment, ~] = matchpairs(CostMat, 1e12); % large cost for unassigned? no, standard call
+        
+        % Map back
+        % assignment is [row, col] -> [sample_local_idx, slot_idx]
+        for t = 1:size(assignment, 1)
+             row_idx = assignment(t, 1);
+             col_idx = assignment(t, 2);
+             
+             global_sample_idx = ambig_samples_in_g_indices_global(row_idx);
+             assigned_cluster = slots_clusters(col_idx);
+             
+             label(global_sample_idx) = assigned_cluster;
         end
     end
+    
+else
+    % Fallback: Greedy approximation for the matching problem (sort all possible edges by Weight)
+    % This approximates Max Weight Matching.
+    if opts.verbose
+        fprintf('n_a=%d > max_exact (%d), using greedy approximation for matching.\n', n_a, opts.max_exact_ambiguous);
+    end
+    
+    % For greedy, we also can process per group to simplify constraints.
+    for g = 1:G
+         ambig_samples_in_g_indices_local = find(group(ambig_idx) == g); 
+         ambig_samples_in_g_indices_global = ambig_idx(ambig_samples_in_g_indices_local);
+         
+         n_a_g = length(ambig_samples_in_g_indices_local);
+         if n_a_g == 0, continue; end
+         
+         quotas_g = R_int(g, :);
+         
+         % Local F
+         F_sub_g = F(ambig_samples_in_g_indices_global, :);
+         
+         % Create list of all possible assignments (sample, cluster) with weights F
+         % We need to carry quotas.
+         % Heuristic: Just greedily assign highest F entries available.
+         
+         % Vectorize: (n_a_g * c) entries
+         % [val, linear_idx] = sort(F_sub_g(:), 'descend');
+         % [sample_idx, cluster_idx] = ind2sub(size(F_sub_g), linear_idx);
+         
+         % To avoid O(N*C) sort if C is large (usually C is small), this is fine.
+         [vals, sort_indices] = sort(F_sub_g(:), 'descend');
+         [rows, cols] = ind2sub(size(F_sub_g), sort_indices);
+         
+         assigned_mask = false(n_a_g, 1);
+         curr_quotas = quotas_g;
+         n_assigned = 0;
+         
+         for t = 1:length(vals)
+             r = rows(t); % local sample index
+             k = cols(t); % cluster index
+             
+             if ~assigned_mask(r) && curr_quotas(k) > 0
+                 % Assign
+                 assigned_mask(r) = true;
+                 curr_quotas(k) = curr_quotas(k) - 1;
+                 
+                 global_idx = ambig_samples_in_g_indices_global(r);
+                 label(global_idx) = k;
+                 
+                 n_assigned = n_assigned + 1;
+                 if n_assigned == n_a_g
+                     break;
+                 end
+             end
+         end
+         
+         % Fallback for any unassigned (should not happen if sum quotas match n_a_g)
+         if n_assigned < n_a_g
+              unassigned_local = find(~assigned_mask);
+              % Assign to any cluster with quota
+              avail_clusters = [];
+              for k=1:c
+                  if curr_quotas(k) > 0
+                      avail_clusters = [avail_clusters, repmat(k, 1, curr_quotas(k))];
+                  end
+              end
+              
+              % Just fill up
+              for t = 1:length(unassigned_local)
+                  if t <= length(avail_clusters)
+                      global_idx = ambig_samples_in_g_indices_global(unassigned_local(t));
+                      label(global_idx) = avail_clusters(t);
+                  end
+              end
+         end
+    end
 end
 
-label = label_final;
 end
-
-
