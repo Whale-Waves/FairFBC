@@ -1,4 +1,4 @@
-function [label, U, W, objHistory, objHistory_afterW, objHistory_afterU] = FairFBC(X, Yg, nCluster, param)
+function [label, U] = FairFBC(X, Yg, nCluster, param)
 
     %% 1. Pre-computation and Initialization
     [nSmp, ~] = size(X);
@@ -12,7 +12,7 @@ function [label, U, W, objHistory, objHistory_afterW, objHistory_afterU] = FairF
     graph_opts.diff_alpha = 0.15;           % PPR teleport probability
     graph_opts.diff_eps = 1e-4;             % APPR precision threshold
     graph_opts.diff_max_push = 2e6;         % Max push operations per anchor
-    graph_opts.useParallel = true;          % Enable parallel processing
+    graph_opts.useParallel = false;          % Disable internal parallel processing
     graph_opts.seed_k = 1;                  % Seeds per anchor
     
     [B, A, anchor_ids] = buildFairBiGraph(X, Yg, param.m, param.knn_size, graph_opts);
@@ -54,94 +54,85 @@ function [label, U, W, objHistory, objHistory_afterW, objHistory_afterU] = FairF
     % Convert to probability distribution by normalizing rows
     U = U_sum ./ row_sums;  % Single normalization step
     
-    % --- Advanced Initialization for W based on Anchor Centrality ---
-    anchor_degrees = sum(B, 1)'; % [m×1] vector of anchor degrees
-    w_diag_init = anchor_degrees ./ (sum(anchor_degrees) + 1e-10); % Normalize to probability simplex: sum = 1
-    W = spdiags(w_diag_init, 0, m, m); % Initialize W with centrality-based weights
+
     
     %% 2. Alternating Optimization Loop
-    objHistory = zeros(param.maxIter, 1);  % Pre-allocate for efficiency (overall objective)
-    objHistory_afterW = zeros(param.maxIter, 1);  % Objective after W update
-    objHistory_afterU = zeros(param.maxIter, 1);  % Objective after U update
+    obj_val = 0; % Initialize for convergence check
+
+
     iter = 1;
     
     while iter <= param.maxIter
         
-        % --- Step A: Fix U, Update w (Principled Optimization) ---
+        % In the new formulation, there is no W update step. W is effectively Identity.
+        % We only perform Gradient Ascent on U followed by Simplex Projection.
         
-        % Extract current weight vector from diagonal matrix W
-        w_diag = full(diag(W));  % Convert current W to weight vector
-        
-        % 1. Calculate gradient of objective function w.r.t. each w_i
-        grad_w = zeros(m, 1);
-        
-        for g = 1:nGroup
-            Wg = Wg_list{g};
-            
-            % Current objective term: X_g = U' * diag(w) * Wg * U
-            Term_g = U' * W * Wg * U;  % W is diag(w_old) from previous iteration
-            Term_g_stable = stabilize_matrix(Term_g, nCluster);
-            
-            % Compute (1/2) * X_g^(-1/2) for gradient calculation
-            Term_g_sqrt = sqrtm(Term_g_stable + 1e-8 * eye(nCluster));
-            Term_g_inv_sqrt = 0.5 * inv(Term_g_sqrt);
-            
-            % Efficient gradient calculation using matrix operations
-            grad_matrix = Wg * U * Term_g_inv_sqrt * U';
-            grad_w = grad_w + diag(grad_matrix);
-        end
-        
-        % 2. Mirror descent (exponential gradient) for w - more stable and faster
-        eta = 2 / (norm(grad_w, 2) + 1e-9);
-        w_candidate = w_diag .* exp(eta * grad_w);    % Mirror step - naturally non-negative
-        w_diag = w_candidate / (sum(w_candidate) + 1e-12);  % Normalize to simplex
-        
-        % 3. Construct the new weight matrix W
-        W = spdiags(w_diag, 0, m, m);
-        
-        % --- Calculate Objective after W Update ---
-        obj_after_W = compute_objective_value(U, W, Wg_list, nGroup, nCluster);
-        objHistory_afterW(iter) = obj_after_W;
-        
-        % --- Step B: Fix W, Update U (using Projected Gradient Ascent) ---
-        % Calculate the gradient of the objective w.r.t. U
+        % --- Calculate Gradient w.r.t U ---
+        % Gradient = sum_g Wg * U * (U' * Wg * U + epsilon * I)^(-1/2)
         grad_U = zeros(m, nCluster);
+        
         for g = 1:nGroup
             Wg = Wg_list{g};
-            Term_g = U' * W * Wg * U;
-            Term_g_stable = stabilize_matrix(Term_g, nCluster);
-            Term_g_sqrt = sqrtm(Term_g_stable + 1e-8 * eye(nCluster));
-            grad_U = grad_U + (W * Wg * U) / Term_g_sqrt;  
+            
+            % Compute M_g = U' * Wg * U
+            Mg = U' * Wg * U;
+            Mg_stable = stabilize_matrix(Mg, nCluster);
+            
+            % Compute (M_g + epsilon*I)^(-1/2)
+            % Add epsilon for numerical stability as per paper
+            epsilon_val = 1e-8; 
+            Mg_eps = Mg_stable + epsilon_val * eye(nCluster);
+            
+            % Compute inverse square root
+            Mg_inv_sqrt = inv(sqrtm(Mg_eps));
+            
+            % Accumulate gradient: Wg * U * Mg^(-1/2)
+            grad_U = grad_U + Wg * U * Mg_inv_sqrt;
         end
         
-        % Gradient Ascent Step with backtracking line search (Armijo condition)
+        % --- Gradient Ascent Step ---
+        % alpha (step size) search with backtracking
         alpha = 3 / (norm(grad_U, 'fro') + 1e-6);
         c = 1e-4; tau = 0.7; max_back = 15;
-        base = compute_objective_value(U, W, Wg_list, nGroup, nCluster);
+        if iter == 1
+            base = compute_objective_value(U, Wg_list, nGroup, nCluster);
+        else
+             base = obj_val;
+        end
         
         for t = 1:max_back
-            U_try = project_to_simplex(U + alpha * grad_U);
-            val = compute_objective_value(U_try, W, Wg_list, nGroup, nCluster);
-            if val >= base + c * alpha * sum(grad_U(:).^2)  % Armijo condition
-                U = U_try; 
-                break;
+            U_temp = U + alpha * grad_U;
+            U_try = project_to_simplex(U_temp);
+            val = compute_objective_value(U_try, Wg_list, nGroup, nCluster);
+            
+            % Check sufficient increase
+            % Note: Armijo condition typically uses gradient projection or just checking increase
+            if val >= base + c * alpha * sum(grad_U(:).^2) 
+                 U = U_try;
+                 break;
             else
-                alpha = alpha * tau;  % Backtrack
+                 alpha = alpha * tau;
+            end
+             
+            % Fallback if loop finishes without break
+            if t == max_back
+                U = U_try; % Take the last attempt
             end
         end
         
-        % --- Calculate and Record Objective Value after U Update ---
-        obj_after_U = compute_objective_value(U, W, Wg_list, nGroup, nCluster);
-        objHistory_afterU(iter) = obj_after_U;
-        objHistory(iter) = obj_after_U;  % Keep overall history for compatibility
+        % Update objective value from the accepted step
+        obj_val = val; 
         
         % --- Check for Convergence ---
         if iter > 15
-            obj_change_ratio = abs(objHistory(iter) - objHistory(iter-1)) / abs(objHistory(iter-1) + 1e-10);
-            if obj_change_ratio < param.tolerance * 0.5
-                break;
+            if iter > 1
+                 obj_change_ratio = abs(obj_val - prev_obj) / abs(prev_obj + 1e-10);
+                 if obj_change_ratio < param.tolerance * 0.5
+                     break;
+                 end
             end
         end
+        prev_obj = obj_val;
         
         iter = iter + 1;
     end
@@ -149,19 +140,16 @@ function [label, U, W, objHistory, objHistory_afterW, objHistory_afterU] = FairF
     %% 3. Finalization and Output
     
     % Truncate all objective histories to actual iterations
-    % Handle both convergence break and normal loop completion cases
     if iter > param.maxIter
         iter = param.maxIter;
     end
-    objHistory = objHistory(1:iter);
-    objHistory_afterW = objHistory_afterW(1:iter);
-    objHistory_afterU = objHistory_afterU(1:iter);
+
+
     
     % Final assignment for data points is F = B * U
     F = B * U;
     
     % Fairness-aware hard assignment with optimized global assignment
-    % Configure parameters for optimal performance
     opts.ambig_quantile = 0.1;          
     opts.max_exact_ambiguous = 11000;    
     opts.verbose = false;               
@@ -170,41 +158,34 @@ function [label, U, W, objHistory, objHistory_afterW, objHistory_afterU] = FairF
 end
 
 % --- Helper Function for Objective Value Computation ---
-function obj_value = compute_objective_value(U, W, Wg_list, nGroup, nCluster)
-% Computes the unified objective function value: sum_g Tr(sqrt(U' * W * Wg * U))
+function obj_value = compute_objective_value(U, Wg_list, nGroup, nCluster)
+% Computes value: sum_g Tr(sqrt(U' * Wg * U))
     obj_value = 0;
     for g = 1:nGroup
         Wg = Wg_list{g};
-        Term_g = U' * W * Wg * U;
+        Term_g = U' * Wg * U;
         Term_g_stable = stabilize_matrix(Term_g, nCluster);
         obj_value = obj_value + trace(sqrtm(Term_g_stable));
     end
     
-    % Handle numerical issues
     if ~isfinite(obj_value) || isnan(obj_value)
-        obj_value = -inf;  % Return a penalty value for invalid results
+        obj_value = -inf;
     end
 end
 
 % --- Helper Function for Matrix Stabilization ---
 function Term_g_stable = stabilize_matrix(Term_g, nCluster)
-% Stabilizes a matrix using spectral radius adaptive perturbation (faster and more stable)
-    % Convert to full matrix to avoid sparse matrix issues
+% Stabilizes a matrix using spectral radius adaptive perturbation
     Term_g_full = full(Term_g);
-    
-    % Ensure matrix is symmetric (for reliable eigenvalue computation)
     Term_g_sym = (Term_g_full + Term_g_full') / 2;
     
-    % Eigenvalue decomposition for PSD enforcement
     [V, D] = eig(Term_g_sym);
     d = diag(D); 
-    d(d < 0) = 0;  % PSD clipping - remove negative eigenvalues
+    d(d < 0) = 0; 
     
-    % Adaptive perturbation based on spectral scale
-    eps0 = 1e-8 * (sum(d) / numel(d) + 1);  % Scale with average eigenvalue
-    d = d + eps0;  % Add small perturbation to all eigenvalues
+    eps0 = 1e-8 * (sum(d) / numel(d) + 1);
+    d = d + eps0;
     
-    % Reconstruct stabilized matrix
     Term_g_stable = V * diag(d) * V';
 end
 
@@ -215,11 +196,10 @@ function P = project_to_simplex(V)
     P = zeros(m, c);
     for i = 1:m
         v_row = V(i, :);
-        % A fast projection algorithm
         v_sorted = sort(v_row, 'descend');
         cumsum_v = cumsum(v_sorted);
         rho = find(v_sorted > (cumsum_v - 1) ./ (1:c), 1, 'last');
-        if isempty(rho)  % Handle edge case
+        if isempty(rho)
             rho = c;
         end
         theta = (cumsum_v(rho) - 1) / rho;
@@ -229,10 +209,7 @@ end
 
 % --- Helper Function for Smart K-means Initialization ---
 function [label, center] = smart_kmeans_init(X, k)
-
     [n, d] = size(X);
-    
-    % Handle NaN values by mean imputation (simple but effective)
     nan_mask = isnan(X);
     if any(nan_mask(:))
         for j = 1:d
@@ -240,30 +217,26 @@ function [label, center] = smart_kmeans_init(X, k)
             if ~isnan(col_mean)
                 X(nan_mask(:,j), j) = col_mean;
             else
-                X(nan_mask(:,j), j) = 0;  % fallback if entire column is NaN
+                X(nan_mask(:,j), j) = 0;
             end
         end
     end
 
     if d >= 512
-        npc = 128;  % reduce dimension
+        npc = 128;
         [coeff, score] = pca(X, 'NumComponents', npc);
-        % kmeans++ on reduced features
         opts = statset('MaxIter', 100, 'Display', 'off');
         [label, ~] = kmeans(score, k, ...
             'Start', 'plus', 'Replicates', 5, ...
             'Options', opts);
-        % map back to original space
         center = zeros(k, d);
         for i = 1:k
             center(i, :) = mean(X(label == i, :), 1);
         end
     else
-        % Direct kmeans++ without PCA
         opts = statset('MaxIter', 100, 'Display', 'off');
         [label, center] = kmeans(X, k, ...
             'Start', 'plus', 'Replicates', 5, ...
             'Options', opts);
     end
 end
-
